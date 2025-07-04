@@ -462,10 +462,10 @@ CPP_template(typename It, typename End)(
  public:
   IteratorRange(It it, End end) : it_{std::move(it)}, end_{std::move(end)} {}
 
-  auto begin() {
+  auto begin() const {
     return IteratorForAccessOperator<int, Accessor>{&dummy, 0, Accessor{it_}};
   }
-  auto end() {
+  auto end() const {
     return IteratorForAccessOperator<int, Accessor>{
         &dummy, static_cast<size_t>(end_ - it_), Accessor{it_}};
   }
