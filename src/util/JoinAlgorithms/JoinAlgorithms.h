@@ -9,7 +9,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <ranges>
+#include <vector>
 
 #include "backports/algorithm.h"
 #include "backports/concepts.h"
@@ -21,6 +24,85 @@
 #include "util/JoinAlgorithms/JoinColumnMapping.h"
 #include "util/TransparentFunctors.h"
 #include "util/TypeTraits.h"
+#include "util/Views.h"
+
+namespace {
+
+// struct LazyFindSmaller
+//     : ad_utility::InputRangeFromGet<ql::span<const Id>::iterator> {
+//   ql::span<const Id>::iterator beg_;
+//   ql::span<const Id>::iterator end_;
+//
+//   LazyFindSmaller(ql::span<const Id>::iterator b,
+//                   ql::span<const Id>::iterator e)
+//       : beg_{b}, end_{e} {}
+//
+//   // The `get` function that is needed for the `InputRangeFromGet`.
+//   std::optional<ql::span<const Id>::iterator> get() override {
+//     if (beg_ == end_) {
+//       return std::nullopt;
+//     }
+//     return beg_++;
+//   }
+// };
+
+template <bool Left, typename T, typename B1, typename B2, typename UndefBlocks,
+          typename CompatibleRowAction, typename Callback>
+struct findUndefValuesHelperFromGet : ad_utility::InputRangeFromGet<T> {
+  UndefBlocks undefBlocks_;
+  const B1& fullBlockLeft_;
+  const B2& fullBlockRight_;
+
+  T& begL_;
+  T& begR_;
+
+  CompatibleRowAction& compatibleRowAction_;
+
+  decltype(ql::views::join(undefBlocks_)) undefBlocksJoin_;
+
+  ad_utility::CallbackOnEndView<decltype(ql::views::join(undefBlocks_)),
+                                Callback>
+      r3_;
+
+  decltype(r3_.begin()) it_;
+  decltype(r3_.end()) end_;
+
+  findUndefValuesHelperFromGet(const B1& fullBlockLeft,
+                               const B2& fullBlockRight, T& begL, T& begR,
+                               const UndefBlocks& undefBlocks,
+                               CompatibleRowAction& compatibleRowAction,
+                               Callback cb)
+      : undefBlocks_(undefBlocks),
+        fullBlockLeft_{fullBlockLeft},
+        fullBlockRight_{fullBlockRight},
+        begL_{begL},
+        begR_{begR},
+        compatibleRowAction_{compatibleRowAction},
+        undefBlocksJoin_{ql::views::join(undefBlocks_)},
+        r3_{ql::views::join(undefBlocks_), cb},
+        it_{r3_.begin()},
+        end_{r3_.end()} {}
+
+  std::optional<T> get() override {
+    if (it_ == end_) {
+      return std::nullopt;
+    }
+
+    if constexpr (Left) {
+      begL_ = *it_;
+      compatibleRowAction_.setInput(*it_, fullBlockRight_.get());
+    } else {
+      begR_ = *it_;
+      compatibleRowAction_.setInput(fullBlockLeft_.get(), *it_);
+    }
+
+    auto tmp = it_;
+    it_++;
+    return *tmp;
+  }
+};
+
+}  // namespace
 
 namespace ad_utility {
 
@@ -559,12 +641,13 @@ CPP_template(typename CompatibleActionT, typename NotFoundActionT,
     // inputs contain UNDEF values only in the last column, and possibly
     // also not only for `OPTIONAL` joins.
     auto endOfUndef = ql::ranges::find_if_not(leftSub, &Id::isUndefined);
+
+    // LazyFindSmaller smaller_undef_range_left(leftSub.begin(), endOfUndef);
     auto findSmallerUndefRangeLeft =
-        [leftSub,
-         endOfUndef](auto&&...) -> cppcoro::generator<decltype(endOfUndef)> {
-      for (auto it = leftSub.begin(); it != endOfUndef; ++it) {
-        co_yield it;
-      }
+        [leftSub, endOfUndef](
+            auto&&...) -> ad_utility::IteratorRange<decltype(leftSub.begin()),
+                                                    decltype(endOfUndef)> {
+      return ad_utility::IteratorRange{leftSub.begin(), endOfUndef};
     };
 
     // Also set up the actions for compatible rows that now work on single
@@ -608,6 +691,8 @@ class BlockAndSubrange {
  private:
   std::shared_ptr<Block> block_;
   Range subrange_;
+  ad_utility::IteratorRange<decltype(block_->begin()), decltype(block_->end())>
+      iteratorRange_;
 
  public:
   // The reference type of the underlying container.
@@ -619,7 +704,8 @@ class BlockAndSubrange {
   // represent the whole container.
   explicit BlockAndSubrange(Block block)
       : block_{std::make_shared<Block>(std::move(block))},
-        subrange_{0, block_->size()} {}
+        subrange_{0, block_->size()},
+        iteratorRange_{block_->begin(), block_->end()} {}
 
   // Return a reference to the last element of the currently specified subrange.
   const_reference back() const {
@@ -641,6 +727,10 @@ class BlockAndSubrange {
     return ql::ranges::subrange{fullBlock().begin() + subrange_.first,
                                 fullBlock().begin() + subrange_.second};
   }
+
+  auto begin() const { return iteratorRange_.begin(); }
+
+  auto end() const { return iteratorRange_.end(); }
 
   // Get a view that iterates over all the indices that belong to the subrange.
   auto getIndexRange() const {
@@ -996,33 +1086,22 @@ CPP_template(typename LeftSide, typename RightSide, typename LessThan,
   // Main implementation for `findUndefValues`.
   template <bool left, typename T, typename B1, typename B2,
             typename UndefBlocks>
-  cppcoro::generator<T> findUndefValuesHelper(const B1& fullBlockLeft,
-                                              const B2& fullBlockRight, T& begL,
-                                              T& begR,
-                                              const UndefBlocks& undefBlocks) {
-    for (const auto& undefBlock : undefBlocks) {
-      // Select proper input table from the stored undef blocks
-      if constexpr (left) {
-        begL = undefBlock.fullBlock().begin();
-        compatibleRowAction_.setInput(undefBlock.fullBlock(),
-                                      fullBlockRight.get());
-      } else {
-        begR = undefBlock.fullBlock().begin();
-        compatibleRowAction_.setInput(fullBlockLeft.get(),
-                                      undefBlock.fullBlock());
-      }
-      const auto& subrange = undefBlock.subrange();
-      // Yield all iterators to the elements within the stored undef blocks.
-      for (auto subIt = subrange.begin(); subIt < subrange.end(); ++subIt) {
-        co_yield subIt;
-      }
-    }
-    // Reset back to original input
-    begL = fullBlockLeft.get().begin();
-    begR = fullBlockRight.get().begin();
-    compatibleRowAction_.setInput(fullBlockLeft.get(), fullBlockRight.get());
-    // No need for further iteration because we know we won't encounter any new
-    // undefined values at this point.
+  auto findUndefValuesHelper(const B1& fullBlockLeft, const B2& fullBlockRight,
+                             T& begL, T& begR, const UndefBlocks& undefBlocks) {
+    auto find_helper =
+        findUndefValuesHelperFromGet<left, T, B1, B2, UndefBlocks,
+                                     CompatibleRowAction,
+                                     std::function<void(void)>>(
+            fullBlockLeft, fullBlockRight, begL, begR, undefBlocks,
+            compatibleRowAction_,
+
+            [&]() {
+              begL = fullBlockLeft.get().begin();
+              begR = fullBlockRight.get().begin();
+              compatibleRowAction_.setInput(fullBlockLeft.get(),
+                                            fullBlockRight.get());
+            });
+    return find_helper;
   }
 
   // Create a generator that yields iterators to all undefined values that
