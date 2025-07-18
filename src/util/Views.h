@@ -8,11 +8,14 @@
 #define QLEVER_SRC_UTIL_VIEWS_H
 
 #include <future>
+#include <iterator>
 #include <optional>
 
 #include "backports/algorithm.h"
 #include "backports/concepts.h"
 #include "backports/span.h"
+#include "range/v3/range/access.hpp"
+#include "range/v3/range/conversion.hpp"
 #include "util/ExceptionHandling.h"
 #include "util/Generator.h"
 #include "util/Iterators.h"
@@ -21,43 +24,32 @@
 
 namespace {
 
-// Flattens double container and splits it at separator
-CPP_template(typename Range, typename ElementType)(
-    requires ql::ranges::input_range<Range>) struct ReChunkAtSeparatorFromGet
-    : ad_utility::InputRangeFromGet<ql::span<ElementType>> {
-  std::vector<ElementType> buffer_;
-  decltype(buffer_.begin()) iter_;
-  ElementType separator_;
+// template <typename Range, typename ElementType>
+// struct ReChunkAtSeparatorFromGet {
+//   Range baseRange_;
+//   decltype(ranges::views::split(baseRange_, ElementType{})) splitView_;
+//   decltype(splitView_.begin()) splitIter_;
+//   std::vector<ElementType> buffer_;
+//   ElementType separator_;
 
-  ReChunkAtSeparatorFromGet(Range generator, ElementType separator)
-      : buffer_{ranges::to<std::vector<ElementType>>(
-            ql::views::join(generator))},
-        iter_{buffer_.begin()},
-        separator_{separator} {}
+//   ReChunkAtSeparatorFromGet(Range base, ElementType separator)
+//       : baseRange_{std::move(base)},
+//         splitView_{ranges::views::split(baseRange_, separator)},
+//         splitIter_{splitView_.begin()},
+//         separator_{separator} {}
 
-  std::optional<ql::span<ElementType>> get() override {
-    if (iter_ == buffer_.end()) return std::nullopt;
+//   std::optional<ranges::subrange<ElementType*>> get() {
+//     if (splitIter_ == splitView_.end()) {
+//       return std::nullopt;
+//     }
 
-    auto found = std::find(iter_, buffer_.end(), separator_);
-    if (found == buffer_.end()) {
-      auto retVal =
-          ql::span<ElementType>{const_cast<char*>(&*iter_),
-                                static_cast<ql::span<ElementType>::index_type>(
-                                    std::distance(iter_, buffer_.end()))};
-      iter_ = buffer_.end();  // mark info that end is reached
-      return retVal;
-    }
-
-    auto retVal =
-        ql::span<ElementType>{const_cast<char*>(&*iter_),
-                              static_cast<ql::span<ElementType>::index_type>(
-                                  std::distance(iter_, found))};
-
-    iter_ = found;
-    iter_++;  // move past separator already found
-    return retVal;
-  }
-};
+//     auto&& chunk = *splitIter_;
+//     buffer_ =
+//         ranges::to<std::vector<ElementType>>(chunk | ranges::views::common);
+//     ++splitIter_;
+//     return ranges::subrange(buffer_.data(), buffer_.data() + buffer_.size());
+//   }
+// };
 
 template <typename SortedBlockView>
 struct uniqueBlockViewFromGet
@@ -395,11 +387,46 @@ CPP_template(typename Int)(
 /// separator and the yields spans of the chunks of data received inbetween.
 CPP_template(typename Range, typename ElementType)(
     requires ql::ranges::input_range<
-        Range>) inline ReChunkAtSeparatorFromGet<Range,
-                                                 ElementType> reChunkAtSeparator(Range
-                                                                                     generator,
-                                                                                 ElementType
-                                                                                     separator) {
+        Range>) inline auto reChunkAtSeparator(Range generator,
+                                               ElementType separator) {
+  // Flattens double container and splits it at separator
+  struct ReChunkAtSeparatorFromGet
+      : ad_utility::InputRangeFromGet<ql::span<ElementType>> {
+    Range generator_;
+    ElementType separator_;
+    decltype(ql::views::join(generator_)) flattenData_;
+    std::vector<ElementType> buffer_;
+    decltype(ranges::begin(flattenData_)) iter_;
+    decltype(ad_utility::OwningView{ranges::views::split(
+        flattenData_ | ranges::views::common, separator_)}) splitView_;
+    decltype(splitView_.begin()) splitIter_;
+
+    ReChunkAtSeparatorFromGet(Range generator, ElementType separator)
+        : generator_{generator},
+          separator_{separator},
+          flattenData_{ql::views::join(generator)},
+          iter_{ranges::begin(flattenData_)},
+          splitView_{ad_utility::OwningView{ranges::views::split(
+              flattenData_ | ranges::views::common, separator)}},
+          splitIter_{splitView_.begin()} {}
+
+    std::optional<ql::span<ElementType>> get() override {
+      if (iter_ == ranges::end(flattenData_)) {
+        return std::nullopt;
+      }
+
+      while (iter_ != ranges::end(flattenData_)) {
+        iter_++;
+      }
+      // auto&& chunk = *splitIter_;
+      // buffer_ =
+      //     ranges::to<std::vector<ElementType>>(chunk |
+      //     ranges::views::common);
+      // ++splitIter_;
+      return std::span{buffer_.begin(), buffer_.end()};
+    }
+  };
+
   return ReChunkAtSeparatorFromGet{generator, separator};
 }
 }  // namespace ad_utility
