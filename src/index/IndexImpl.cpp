@@ -22,11 +22,14 @@
 #include "util/BatchedPipeline.h"
 #include "util/CachingMemoryResource.h"
 #include "util/HashMap.h"
+#include "util/InputRangeUtils.h"
+#include "util/Iterators.h"
 #include "util/JoinAlgorithms/JoinAlgorithms.h"
 #include "util/ProgressBar.h"
 #include "util/ThreadSafeQueue.h"
 #include "util/Timer.h"
 #include "util/TypeTraits.h"
+#include "util/Views.h"
 
 using std::array;
 using namespace ad_utility::memory_literals;
@@ -79,10 +82,12 @@ template <typename T1, typename T2>
 static auto lazyScanWithPermutedColumns(T1& sorterPtr, T2 columnIndices) {
   auto setSubset = [columnIndices](auto& idTable) {
     idTable.setColumnSubset(columnIndices);
+    return std::move(idTable);
   };
-  return ad_utility::inPlaceTransformView(
+
+  return ad_utility::CachingTransformInputRange{
       ad_utility::OwningView{sorterPtr->template getSortedBlocks<0>()},
-      setSubset);
+      setSubset};
 }
 
 // Perform a lazy optional block join on the first column of `leftInput` and
